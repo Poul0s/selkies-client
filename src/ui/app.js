@@ -42,13 +42,13 @@ function delPath(o, p) {
 }
 
 let toastTimer;
-function toast(msg, ok = false) {
+function toast(msg, ok = false, ms = 4000) {
   const t = $('toast');
   t.textContent = msg;
   t.className = 'toast' + (ok ? ' ok' : '');
   t.hidden = false;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { t.hidden = true; }, 4000);
+  toastTimer = setTimeout(() => { t.hidden = true; }, ms);
 }
 
 // Splits a command line into argv, honouring "double" and 'single' quotes
@@ -431,6 +431,7 @@ async function init() {
   $('settings-btn').addEventListener('click', openGlobalEditor);
   $('modal').addEventListener('mousedown', e => { if (e.target === $('modal')) closeModal(); });
   document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+  api.onSessionError(msg => toast('Connection failed: ' + msg, false, 12000));
   handleSuggestion(state.suggestion);
   render();
 }

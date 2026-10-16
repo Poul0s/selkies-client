@@ -17,6 +17,28 @@ let loginAttempts = 0;
 let certDialogShown = false;
 let certDecision = null;
 let shortcuts;
+let sessionError = null;  // reported to the launcher once the stream window is closed
+let loadTimer = null;
+
+const NET_ERRORS = {
+  ERR_CONNECTION_REFUSED: 'Connection refused: nothing is listening on that address and port.',
+  ERR_CONNECTION_TIMED_OUT: 'Connection timed out: the server did not answer.',
+  ERR_NAME_NOT_RESOLVED: 'Host name could not be resolved.',
+  ERR_ADDRESS_UNREACHABLE: 'Address unreachable: check the network or VPN.',
+  ERR_INTERNET_DISCONNECTED: 'No network connection.',
+  ERR_CONNECTION_RESET: 'Connection reset by the server.',
+  ERR_SSL_PROTOCOL_ERROR: 'TLS error: the server may be using plain HTTP (try http://host:port).',
+  ERR_CERT_AUTHORITY_INVALID: 'The server certificate is not trusted.',
+};
+
+// Ends the session and tells the user why (in the launcher, or a box without one)
+function failSession(message) {
+  if (!win) return;
+  const text = `${cfg.profileName || cfg.host} (${cfg.url})\n${message}`;
+  if (launcher) sessionError = text;
+  else dialog.showErrorBox('Connection failed', text);
+  win.close();
+}
 
 /* ---------- shortcuts ---------- */
 function parseShortcut(s) {
@@ -146,14 +168,14 @@ function createStreamWindow() {
   });
 
   wc.on('did-finish-load', () => {
+    clearTimeout(loadTimer);
     loginAttempts = 0;
     if (cfg.autoCapture && !captured) capture();
   });
 
   wc.on('did-fail-load', (e, code, desc, url, isMainFrame) => {
     if (!isMainFrame || code === -3) return; // -3: aborted (navigation replaced)
-    dialog.showErrorBox('Connection failed', `${cfg.url}\n\n${desc} (${code})`);
-    if (win) win.close();
+    failSession(NET_ERRORS[desc] || `${desc} (${code})`);
   });
 
   // Avoid leaving the WM in passthrough mode when the window loses focus
@@ -166,16 +188,27 @@ function createStreamWindow() {
     }
   });
   win.on('closed', () => {
+    clearTimeout(loadTimer);
     win = null;
     cfg = null;
-    if (launcher) { launcher.show(); launcher.focus(); }
+    if (launcher) {
+      launcher.show();
+      launcher.focus();
+      if (sessionError) launcher.webContents.send('session:error', sessionError);
+      sessionError = null;
+    }
     else app.quit();
   });
 
   // Only load the page once the window is really fullscreen, because the
   // Selkies client measures the window size at load time.
   let loaded = false;
-  const load = () => { if (!loaded && win) { loaded = true; win.loadURL(cfg.url); } };
+  const load = () => {
+    if (loaded || !win) return;
+    loaded = true;
+    win.loadURL(cfg.url).catch(() => {}); // failures are reported by did-fail-load
+    loadTimer = setTimeout(() => failSession('Timed out: the server did not respond in 30 seconds.'), 30000);
+  };
   win.once('enter-full-screen', load);
   win.show();
   setTimeout(load, 1500);
@@ -322,9 +355,7 @@ app.on('login', (event, wc, details, authInfo, callback) => {
     && String(authInfo.port) === cfg.port;
   if (!target || !cfg.password || ++loginAttempts > 3) {
     callback(); // cancel
-    if (loginAttempts === 4) {
-      dialog.showErrorBox('Authentication refused', 'Wrong or missing credentials.');
-    }
+    if (loginAttempts === 4) failSession('Authentication refused: wrong user name or password.');
     return;
   }
   callback(cfg.user, cfg.password);
@@ -336,6 +367,13 @@ function setupPermissions() {
     catch { return false; }
   };
   const ses = session.defaultSession;
+  // HTTP errors on the page itself (502 behind a proxy, 404 on a wrong path...)
+  ses.webRequest.onCompleted({ urls: ['*://*/*'] }, details => {
+    if (details.resourceType !== 'mainFrame' || !win || details.webContentsId !== win.webContents.id) return;
+    if (details.statusCode >= 400 && details.statusCode !== 401) {
+      failSession(`The server answered HTTP ${details.statusCode}${details.statusLine ? ` (${details.statusLine.replace(/^HTTP\/\S+ \d+ ?/, '')})` : ''}.`);
+    }
+  });
   ses.setPermissionRequestHandler((wc, permission, cb, details) =>
     cb(allowed(permission, details.requestingUrl)));
   ses.setPermissionCheckHandler((wc, permission, requestingOrigin) =>
