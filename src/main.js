@@ -1,16 +1,21 @@
 'use strict';
-const { app, BrowserWindow, Menu, dialog, session } = require('electron');
+const { app, BrowserWindow, Menu, dialog, session, ipcMain } = require('electron');
 const { execFile, execFileSync } = require('child_process');
+const fs = require('fs');
 const path = require('path');
-const { loadConfig } = require('./config');
+const config = require('./config');
 
 // Stable userData path, regardless of how the app is launched
 app.setPath('userData', path.join(app.getPath('appData'), 'selkies-client'));
 
-let cfg, win;
+const ICON = path.join(__dirname, 'icon.png');
+
+let boot;                 // { args, file, direct }
+let cfg, win, launcher;   // cfg/win: the running stream session, if any
 let captured = false;
 let loginAttempts = 0;
 let certDialogShown = false;
+let certDecision = null;
 let shortcuts;
 
 /* ---------- shortcuts ---------- */
@@ -23,14 +28,36 @@ function parseShortcut(s) {
   else if (/^[0-9]$/.test(key)) code = 'Digit' + key;
   return {
     code,
+    key: /^[a-z0-9]$/i.test(key) ? key.toLowerCase() : null,
     ctrl: mods.has('ctrl') || mods.has('control'),
     alt: mods.has('alt'),
     shift: mods.has('shift'),
     meta: mods.has('meta') || mods.has('super') || mods.has('cmd'),
   };
 }
-const matches = (sc, i) => i.code === sc.code && !!i.control === sc.ctrl
-  && !!i.alt === sc.alt && !!i.shift === sc.shift && !!i.meta === sc.meta;
+// Letters/digits match the produced character (so AZERTY and QWERTY layouts both
+// work); anything else falls back to the physical key code.
+const matches = (sc, i) => {
+  const byKey = sc.key && i.key && /^[a-z0-9]$/i.test(i.key);
+  return (byKey ? i.key.toLowerCase() === sc.key : i.code === sc.code)
+    && !!i.control === sc.ctrl && !!i.alt === sc.alt && !!i.shift === sc.shift && !!i.meta === sc.meta;
+};
+
+let lastShortcut = { name: '', at: 0 };
+function runShortcut(name) {
+  const now = Date.now();
+  if (lastShortcut.name === name && now - lastShortcut.at < 300) return; // both paths fired
+  lastShortcut = { name, at: now };
+  if (!win) return;
+  if (name === 'toggle') captured ? release() : capture();
+  else if (name === 'reload') win.webContents.reloadIgnoringCache();
+  else if (name === 'disconnect') win.close(); // back to the launcher (quits without one)
+}
+
+ipcMain.handle('shortcuts:get', e => (win && e.sender === win.webContents ? shortcuts : null));
+ipcMain.on('shortcut', (e, name) => {
+  if (win && e.sender === win.webContents && shortcuts && name in shortcuts) runShortcut(name);
+});
 
 /* ---------- hooks (commands run without a shell) ---------- */
 function runHooks(list, sync = false) {
@@ -51,7 +78,12 @@ async function capture() {
   captured = true;
   runHooks(cfg.hooks.onCapture);
   try {
+    // Ask the Selkies client for its own "gaming mode" (fullscreen + pointer lock +
+    // keyboard lock armed at the right moment, which is what lets Chromium hold the
+    // Win key); fall back to a plain keyboard lock if the page did not react.
     await win.webContents.executeJavaScript(`(async () => {
+      window.postMessage({ type: 'requestGamingMode' }, window.location.origin);
+      await new Promise(r => setTimeout(r, 1500));
       if (!document.fullscreenElement) await document.documentElement.requestFullscreen();
       if (navigator.keyboard && navigator.keyboard.lock) await navigator.keyboard.lock();
     })()`, true);
@@ -72,9 +104,16 @@ async function release() {
   runHooks(cfg.hooks.onRelease);
 }
 
-/* ---------- window ---------- */
-function createWindow() {
+/* ---------- stream window ---------- */
+function createStreamWindow() {
+  const additionalArguments = [];
+  if (Object.keys(cfg.streamSettings).length) {
+    additionalArguments.push('--stream-settings=' + encodeURIComponent(
+      JSON.stringify({ origin: cfg.origin, settings: cfg.streamSettings })));
+  }
+
   win = new BrowserWindow({
+    icon: ICON,
     fullscreen: true,
     show: false,
     backgroundColor: '#000000',
@@ -84,6 +123,8 @@ function createWindow() {
       sandbox: true,
       nodeIntegration: false,
       spellcheck: false,
+      preload: path.join(__dirname, 'preload-stream.js'),
+      additionalArguments,
     },
   });
 
@@ -94,18 +135,14 @@ function createWindow() {
     catch { e.preventDefault(); }
   });
 
+  // First path: before the page sees the key. With a locked keyboard Chromium may
+  // skip it, so the stream preload also reports the shortcuts from inside the page.
   wc.on('before-input-event', (event, input) => {
     if (input.type !== 'keyDown') return;
-    if (matches(shortcuts.toggle, input)) {
-      event.preventDefault();
-      captured ? release() : capture();
-    } else if (matches(shortcuts.reload, input)) {
-      event.preventDefault();
-      wc.reloadIgnoringCache();
-    } else if (matches(shortcuts.quit, input)) {
-      event.preventDefault();
-      app.quit();
-    }
+    const name = Object.keys(shortcuts).find(n => matches(shortcuts[n], input));
+    if (!name) return;
+    event.preventDefault();
+    runShortcut(name);
   });
 
   wc.on('did-finish-load', () => {
@@ -113,22 +150,147 @@ function createWindow() {
     if (cfg.autoCapture && !captured) capture();
   });
 
+  wc.on('did-fail-load', (e, code, desc, url, isMainFrame) => {
+    if (!isMainFrame || code === -3) return; // -3: aborted (navigation replaced)
+    dialog.showErrorBox('Connection failed', `${cfg.url}\n\n${desc} (${code})`);
+    if (win) win.close();
+  });
+
   // Avoid leaving the WM in passthrough mode when the window loses focus
   win.on('blur', () => release());
   win.on('focus', () => { if (cfg.recaptureOnFocus) capture(); });
-  win.on('closed', () => { win = null; });
+  win.on('close', () => {
+    if (captured) {
+      captured = false;
+      runHooks(cfg.hooks.onRelease, true);
+    }
+  });
+  win.on('closed', () => {
+    win = null;
+    cfg = null;
+    if (launcher) { launcher.show(); launcher.focus(); }
+    else app.quit();
+  });
 
   // Only load the page once the window is really fullscreen, because the
   // Selkies client measures the window size at load time.
   let loaded = false;
-  const load = () => { if (!loaded) { loaded = true; win.loadURL(cfg.url); } };
+  const load = () => { if (!loaded && win) { loaded = true; win.loadURL(cfg.url); } };
   win.once('enter-full-screen', load);
   win.show();
   setTimeout(load, 1500);
 }
 
+// Starts a session; returns { ok } or { error } for the launcher
+function connect(name, args = {}) {
+  if (win) return { error: 'A session is already running' };
+  let c;
+  try {
+    c = config.buildConfig(config.readRaw(boot.file), name, args);
+    if (!c.password) {
+      return { error: 'No password: set one in the profile, or define SELKIES_PASSWORD.' };
+    }
+  } catch (e) {
+    return { error: e.message };
+  }
+  cfg = c;
+  shortcuts = {
+    toggle: parseShortcut(cfg.shortcuts.toggleCapture),
+    reload: parseShortcut(cfg.shortcuts.reload),
+    disconnect: parseShortcut(cfg.shortcuts.disconnect),
+  };
+  loginAttempts = 0;
+  certDialogShown = false;
+  certDecision = null;
+  createStreamWindow();
+  if (launcher) launcher.hide();
+  return { ok: true };
+}
+
+/* ---------- launcher window ---------- */
+function createLauncher() {
+  launcher = new BrowserWindow({
+    icon: ICON,
+    width: 1080,
+    height: 720,
+    minWidth: 720,
+    minHeight: 520,
+    title: 'Selkies Client',
+    backgroundColor: '#14161c',
+    webPreferences: {
+      contextIsolation: true,
+      sandbox: true,
+      nodeIntegration: false,
+      preload: path.join(__dirname, 'ui', 'preload.js'),
+    },
+  });
+  launcher.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  launcher.webContents.on('will-navigate', e => e.preventDefault());
+  launcher.on('closed', () => { launcher = null; if (!win) app.quit(); });
+  launcher.loadFile(path.join(__dirname, 'ui', 'index.html'));
+}
+
+function trustedSender(e) {
+  return launcher && e.sender === launcher.webContents;
+}
+
+ipcMain.handle('config:get', e => {
+  if (!trustedSender(e)) return null;
+  let raw = {};
+  let error = null;
+  const exists = fs.existsSync(boot.file);
+  try { raw = config.readRaw(boot.file); } catch (err) { error = err.message; }
+  return {
+    raw, error, exists, defaults: config.DEFAULTS, file: boot.file, platform: process.platform,
+    suggestion: config.detectHooks(),
+  };
+});
+
+ipcMain.handle('hooks:detect', e => (trustedSender(e) ? config.detectHooks() : null));
+
+ipcMain.handle('config:save', (e, raw) => {
+  if (!trustedSender(e)) return { error: 'forbidden' };
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { error: 'invalid config' };
+  try { config.writeRaw(boot.file, raw); return { ok: true }; }
+  catch (err) { return { error: err.message }; }
+});
+
+ipcMain.handle('session:connect', (e, name) => {
+  if (!trustedSender(e)) return { error: 'forbidden' };
+  return connect(name);
+});
+
 /* ---------- network: certificate, auth, permissions ---------- */
+function saveFingerprint(fingerprint) {
+  try {
+    const raw = config.readRaw(boot.file);
+    const profile = raw.profiles && raw.profiles[cfg.profileName];
+    if (!profile) return;
+    profile.certFingerprint = fingerprint;
+    config.writeRaw(boot.file, raw);
+  } catch (e) {
+    console.error('could not save fingerprint:', e.message);
+  }
+}
+
+async function askTrust(fingerprint) {
+  const { response } = await dialog.showMessageBox(win, {
+    type: 'warning',
+    title: 'Untrusted certificate',
+    message: `The server "${cfg.host}" presented a certificate that is not trusted.`,
+    detail: `Fingerprint:\n${fingerprint}\n\nTrust it and remember it for this profile?`,
+    buttons: ['Trust and save', 'Cancel'],
+    defaultId: 1,
+    cancelId: 1,
+  });
+  if (response !== 0) return false;
+  cfg.certFingerprint = fingerprint;
+  saveFingerprint(fingerprint);
+  return true;
+}
+
 app.on('certificate-error', (event, wc, url, error, certificate, callback) => {
+  if (!cfg) return;
   let host;
   try { host = new URL(url).host; } catch { return; }
   if (host !== cfg.host) return; // default behaviour: reject
@@ -136,24 +298,32 @@ app.on('certificate-error', (event, wc, url, error, certificate, callback) => {
   if (cfg.insecure || (cfg.certFingerprint && certificate.fingerprint === cfg.certFingerprint)) {
     return callback(true);
   }
-  if (!certDialogShown) {
-    certDialogShown = true;
-    dialog.showErrorBox('Certificat non approuvé',
-      `Empreinte reçue :\n${certificate.fingerprint}\n\n` +
-      'Si vous reconnaissez ce serveur, copiez-la dans "certFingerprint" ' +
-      'du profil, puis relancez.');
+  if (!cfg.saved) { // started from the command line: nothing to update
+    if (!certDialogShown) {
+      certDialogShown = true;
+      dialog.showErrorBox('Untrusted certificate',
+        `Received fingerprint:\n${certificate.fingerprint}\n\n` +
+        'If you recognise this server, copy it into "certFingerprint" ' +
+        'of the profile, then relaunch.');
+    }
+    return callback(false);
   }
-  callback(false);
+  // One prompt shared by all concurrent certificate errors
+  certDecision = certDecision || askTrust(certificate.fingerprint).then(ok => {
+    if (!ok && win) win.close();
+    return ok;
+  });
+  certDecision.then(callback);
 });
 
 app.on('login', (event, wc, details, authInfo, callback) => {
   event.preventDefault();
-  const target = !authInfo.isProxy && authInfo.host === cfg.hostname
+  const target = cfg && !authInfo.isProxy && authInfo.host === cfg.hostname
     && String(authInfo.port) === cfg.port;
   if (!target || !cfg.password || ++loginAttempts > 3) {
     callback(); // cancel
     if (loginAttempts === 4) {
-      dialog.showErrorBox('Authentification refusée', 'Identifiants incorrects ou absents.');
+      dialog.showErrorBox('Authentication refused', 'Wrong or missing credentials.');
     }
     return;
   }
@@ -162,7 +332,7 @@ app.on('login', (event, wc, details, authInfo, callback) => {
 
 function setupPermissions() {
   const allowed = (permission, origin) => {
-    try { return new URL(origin).origin === cfg.origin && cfg.permissions.includes(permission); }
+    try { return !!cfg && new URL(origin).origin === cfg.origin && cfg.permissions.includes(permission); }
     catch { return false; }
   };
   const ses = session.defaultSession;
@@ -174,28 +344,34 @@ function setupPermissions() {
 
 /* ---------- lifecycle ---------- */
 app.whenReady().then(() => {
-  try {
-    cfg = loadConfig(app.getPath('userData'), process.argv);
-    if (!cfg.password) throw new Error(
-      'Mot de passe introuvable : définissez la variable SELKIES_PASSWORD, ' +
-      '"passwordEnv" ou "passwordFile" dans le profil.');
-    shortcuts = {
-      toggle: parseShortcut(cfg.shortcuts.toggleCapture),
-      reload: parseShortcut(cfg.shortcuts.reload),
-      quit: parseShortcut(cfg.shortcuts.quit),
-    };
-  } catch (e) {
-    dialog.showErrorBox('Selkies Client', e.message);
-    return app.exit(1);
-  }
+  boot = config.loadBoot(app.getPath('userData'), process.argv);
   if (process.platform !== 'darwin') Menu.setApplicationMenu(null);
   setupPermissions();
-  createWindow();
+
+  if (boot.direct) { // --profile / --host: skip the launcher
+    let res;
+    try {
+      const raw = config.readRaw(boot.file);
+      if (!boot.args.host && !(raw.profiles || {})[boot.args.profile]) {
+        throw new Error(`Unknown profile: ${boot.args.profile}`);
+      }
+      // connect() re-reads the file; pass CLI overrides through
+      res = connect(boot.args.profile, boot.args);
+    } catch (e) {
+      res = { error: e.message };
+    }
+    if (res.error) {
+      dialog.showErrorBox('Selkies Client', res.error);
+      return app.exit(1);
+    }
+  } else {
+    createLauncher();
+  }
 });
 
 app.on('window-all-closed', () => app.quit());
 app.on('will-quit', () => {
-  if (captured) {            // never leave the WM in passthrough
+  if (captured && cfg) {     // never leave the WM in passthrough
     captured = false;
     runHooks(cfg.hooks.onRelease, true);
   }

@@ -1,9 +1,10 @@
 {
   "name": "selkies-client",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Fullscreen Selkies client with keyboard capture",
   "author": "Paul Salamé",
   "main": "src/main.js",
+  "desktopName": "selkies-client.desktop",
   "scripts": {
     "start": "electron .",
     "dist": "electron-builder",
@@ -22,7 +23,8 @@
         "AppImage"
       ],
       "category": "Network",
-      "icon": "build/icon.png"
+      "icon": "build/icon.png",
+      "syncDesktopName": true
     },
     "win": {
       "target": [
