@@ -59,6 +59,7 @@ function tokenize(line) {
   while ((m = re.exec(line))) out.push(m[1] !== undefined ? m[1].replace(/\\(.)/g, '$1') : m[2] ?? m[3]);
   return out;
 }
+const row = (label, ...ctl) => h('div', { class: 'row' }, h('label', {}, label), h('div', { class: 'ctl' }, ctl));
 const quote = s => (/[\s"']/.test(s) || s === '' ? `"${s.replace(/(["\\])/g, '\\$1')}"` : s);
 
 /* ---------- field controls ---------- */
@@ -67,12 +68,19 @@ const QUALITIES = [
   ['high', 'High'], ['ultra', 'Ultra'],
 ];
 
+const STREAM_MODES = [
+  ['auto', 'Auto (WebSocket with Tailscale)'], ['websocket', 'WebSocket'], ['webrtc', 'WebRTC'],
+];
+
 const OVERRIDABLE = [
   ['Stream', [
     { id: 'bitrate', type: 'bitrate', label: 'Bitrate limit',
       hint: 'Empty or 0 = no limit. A limit switches the encoder to constant-bitrate mode.' },
     { path: 'stream.quality', type: 'select', label: 'Quality', options: QUALITIES,
       hint: 'Constant-quality preset, used when no bitrate limit is set (also drives JPEG quality).' },
+    { path: 'stream.mode', type: 'select', label: 'Server mode', options: STREAM_MODES,
+      hint: 'Transport the server runs Selkies in (Discord bot: /start selkies mode:websocket). '
+        + 'The client cannot change it: it only warns when the server answers differently. WebRTC cannot go through Tailscale.' },
   ]],
   ['Input', [
     { path: 'autoCapture', type: 'bool', label: 'Keyboard', text: 'Capture the keyboard on connect' },
@@ -95,7 +103,7 @@ const OVERRIDABLE = [
 ];
 
 // read/write/clear on a config object for one field
-function accessors(f) {
+function accessors(f, path = f.path) {
   if (f.type === 'bitrate') {
     return {
       read: o => {
@@ -108,9 +116,9 @@ function accessors(f) {
     };
   }
   return {
-    read: o => getPath(o, f.path),
-    write: (o, v) => setPath(o, f.path, v),
-    clear: o => delPath(o, f.path),
+    read: o => getPath(o, path),
+    write: (o, v) => setPath(o, path, v),
+    clear: o => delPath(o, path),
   };
 }
 
@@ -156,11 +164,13 @@ function makeControl(f) {
 }
 
 // One settings row; in a profile it can inherit the global value
+// A field may use another key for the global value (f.globalPath, e.g. tailscale.useByDefault)
 function overridableRow(f, scope, ownObj, inheritedObj) {
-  const acc = accessors(f);
+  const globalPath = f.globalPath || f.path;
+  const acc = accessors(f, scope === 'global' ? globalPath : f.path);
   const ctl = makeControl(f);
   const own = acc.read(ownObj);
-  const inherited = acc.read(inheritedObj);
+  const inherited = accessors(f, globalPath).read(inheritedObj);
   let override = null;
   const sync = () => {
     ctl.disable(!override.checked);
@@ -189,7 +199,7 @@ function overridableRow(f, scope, ownObj, inheritedObj) {
 }
 
 /* ---------- editor ---------- */
-function closeModal() { $('modal').hidden = true; $('modal').replaceChildren(); }
+function closeModal() { $('modal').hidden = true; $('modal').replaceChildren(); tsRender = null; }
 
 function overridableSections(scope, ownObj, inheritedObj) {
   const rows = [];
@@ -213,18 +223,142 @@ async function persist() {
   return true;
 }
 
+/* ---------- Tailscale ---------- */
+// Profile: follows the global default (tailscale.useByDefault) unless overridden
+const TS_USE = {
+  path: 'tailscale.use', globalPath: 'tailscale.useByDefault', type: 'bool', label: 'Tailscale',
+  text: 'Go through Tailscale (SOCKS5)',
+  hint: 'The server must be a device of your tailnet (MagicDNS name or 100.x address) running Selkies in WebSocket mode.',
+};
+
+let tsStatus = null;   // last state reported by the main process
+let tsRender = null;   // redraws the open Settings dialog
+
+const TS_STATES = {
+  off: 'Disconnected', starting: 'Starting…', connecting: 'Connecting…',
+  login: 'Waiting for login: finish in your browser', approval: 'Waiting for an admin to approve this device',
+};
+
+const tailscaleEnabled = () => !!(globalsOf(raw).tailscale || {}).enabled;
+
+// Global settings block: enable, device name, authentication, live state and Connect / Disconnect
+function tailscaleSection(draft, saveDraft) {
+  const t = draft.tailscale || {};
+  const enabled = h('input', { type: 'checkbox' });
+  enabled.checked = !!t.enabled;
+  const host = h('input', { type: 'text', value: t.hostname || '', spellcheck: 'false',
+    placeholder: 'selkies-client-<this computer>' });
+  const src = h('select', {},
+    h('option', { value: 'interactive' }, 'Interactive login (browser)'),
+    h('option', { value: 'env' }, 'Auth key from an environment variable'),
+    h('option', { value: 'file' }, 'Auth key read from a file'),
+    h('option', { value: 'stored' }, 'Auth key saved in config file'));
+  let cur = t.authKeyFile ? 'file' : t.authKey ? 'stored' : t.authKeyEnv ? 'env' : 'interactive';
+  src.value = cur;
+  const vals = { env: t.authKeyEnv || '', file: t.authKeyFile || '', stored: t.authKey || '' };
+  const secret = h('input', { type: 'text', spellcheck: 'false', value: vals[cur] || '' });
+  const note = h('small', {});
+  const syncSrc = () => {
+    if (cur !== 'interactive') vals[cur] = secret.value;
+    cur = src.value;
+    secret.hidden = cur === 'interactive';
+    secret.value = vals[cur] || '';
+    secret.type = cur === 'stored' ? 'password' : 'text';
+    secret.placeholder = { env: 'TS_AUTHKEY', file: '~/.config/selkies-client/tskey.txt', stored: 'tskey-auth-…' }[cur] || '';
+    note.textContent = {
+      interactive: 'A login link opens in your browser the first time; the login is then kept in the app data folder.',
+      env: 'Without a value, TS_AUTHKEY is used. If that variable is set, it always wins over the other sources.',
+      file: 'One line, chmod 600 recommended. TS_AUTHKEY, if set, wins.',
+      stored: 'Stored in plain text in the config file (readable only by you). TS_AUTHKEY, if set, wins.',
+    }[cur];
+  };
+  src.addEventListener('change', syncSrc);
+  const useDefault = overridableRow({ ...TS_USE, label: 'Default', text: 'Profiles go through Tailscale by default' },
+    'global', draft, state.defaults);
+
+  const text = h('span', { style: 'flex:1 1 100%;white-space:pre-line' });
+  const bConnect = h('button', {}, 'Connect');
+  const bDisconnect = h('button', { class: 'ghost' }, 'Disconnect');
+  const bLogin = h('button', { class: 'ghost' }, 'Open login page');
+  const bForget = h('button', { class: 'ghost', title: 'Log this device out of the tailnet and delete its saved login' }, 'Forget this device');
+  bConnect.addEventListener('click', async () => {
+    if (!enabled.checked) return toast('Tick “Enable Tailscale” first');
+    if (!(await saveDraft())) return; // the main process reads the saved settings
+    const res = await api.tailscale.connect();
+    if (res.error) toast(res.error);
+  });
+  bDisconnect.addEventListener('click', () => api.tailscale.disconnect());
+  bLogin.addEventListener('click', () => api.tailscale.openLogin());
+  let armed = false;
+  bForget.addEventListener('click', async () => {
+    if (!armed) { armed = true; bForget.textContent = 'Click again to confirm'; return; }
+    armed = false;
+    bForget.textContent = 'Forget this device';
+    const res = await api.tailscale.forget();
+    toast(res.error || 'Device forgotten: the next connection needs a new login', !res.error);
+  });
+
+  tsRender = s => {
+    const busy = s.state !== 'off' && s.state !== 'error';
+    text.textContent = !s.available ? s.reason
+      : s.state === 'connected' ? `Connected: ${s.ip}${s.dnsName ? ` (${s.dnsName})` : ''}`
+      : s.state === 'error' ? `Error: ${s.error}` : TS_STATES[s.state] || s.state;
+    text.style.color = s.state === 'connected' ? 'var(--ok)' : s.state === 'error' || !s.available ? 'var(--danger)' : '';
+    bConnect.disabled = !s.available || busy;
+    bDisconnect.disabled = !busy;
+    bLogin.hidden = s.state !== 'login';
+    bForget.disabled = !s.available;
+  };
+  syncSrc();
+  tsRender(tsStatus);
+
+  return {
+    el: h('section', {}, h('h3', {}, 'Tailscale'),
+      row('', h('label', { class: 'inherit', style: 'color:inherit;font-size:inherit' }, enabled,
+        ' Enable Tailscale (embedded, nothing to install)')),
+      row('Device name', host),
+      row('Authentication', src, secret, note),
+      useDefault.el,
+      row('Status', text, bConnect, bDisconnect, bLogin, bForget)),
+    apply: target => {
+      if (!enabled.checked && !target.tailscale) return; // never configured: leave the file as it is
+      const next = { ...(target.tailscale || {}), enabled: enabled.checked };
+      for (const k of ['hostname', 'authKeyEnv', 'authKeyFile', 'authKey']) delete next[k];
+      if (host.value.trim()) next.hostname = host.value.trim();
+      vals[cur] = secret.value.trim();
+      const key = { env: 'authKeyEnv', file: 'authKeyFile', stored: 'authKey' }[cur];
+      if (key && vals[cur]) next[key] = vals[cur];
+      else if (cur === 'env') next.authKeyEnv = 'TS_AUTHKEY';
+      target.tailscale = next;
+      useDefault.apply(target);
+    },
+  };
+}
+
 function openGlobalEditor() {
   const draft = clone(globalsOf(raw));
   const { sections, rows } = overridableSections('global', draft, state.defaults);
-  const save = async () => {
+  // Applies the form and writes the config file; true when saved
+  const commit = async () => {
     rows.forEach(r => r.apply(draft));
+    tsSection.apply(draft);
     const next = { ...(raw.default ? { default: raw.default } : {}), ...draft, profiles: raw.profiles || {} };
     const backup = raw;
     raw = next;
-    if (await persist()) { closeModal(); render(); toast('Settings saved', true); } else raw = backup;
+    if (await persist()) return true;
+    raw = backup;
+    return false;
   };
+  const save = async () => {
+    if (await commit()) { closeModal(); render(); toast('Settings saved', true); }
+  };
+  const tsSection = tailscaleSection(draft, async () => { // Connect saves first, without closing
+    const ok = await commit();
+    if (ok) render();
+    return ok;
+  });
   showDialog('Global settings', h('p', { style: 'margin:12px 0 0;color:var(--muted)' },
-    'Defaults for every profile. Each profile can override them.'), sections, [
+    'Defaults for every profile. Each profile can override them.'), sections, tsSection.el, [
     h('button', { onclick: save }, 'Save'),
     h('button', { class: 'ghost', onclick: closeModal }, 'Cancel'),
     h('button', { class: 'ghost', style: 'margin-left:auto', title: 'Re-detect the window manager and refill the hooks (not saved until you click Save)',
@@ -243,7 +377,7 @@ function openProfileEditor(oldName) {
   const p = isNew ? {} : clone(raw.profiles[oldName]);
   const globals = { ...clone(state.defaults), ...clone(globalsOf(raw)) };
   // deep-merge one level (stream / shortcuts / hooks) so inheritance shows real values
-  for (const k of ['stream', 'shortcuts', 'hooks']) {
+  for (const k of ['stream', 'shortcuts', 'hooks', 'tailscale']) {
     globals[k] = { ...state.defaults[k], ...(globalsOf(raw)[k] || {}) };
   }
 
@@ -274,7 +408,6 @@ function openProfileEditor(oldName) {
   const isDefault = h('input', { type: 'checkbox' });
   isDefault.checked = !isNew && raw.default === oldName;
 
-  const row = (label, ...ctl) => h('div', { class: 'row' }, h('label', {}, label), h('div', { class: 'ctl' }, ctl));
   const connection = h('section', {}, h('h3', {}, 'Connection'),
     row('Name', name), row('Host', host), row('User', user),
     row('Password', src, secret, hint),
@@ -282,6 +415,11 @@ function openProfileEditor(oldName) {
     row('', h('label', { class: 'inherit', style: 'color:inherit;font-size:inherit' }, isDefault, ' Default profile')));
 
   const { sections, rows } = overridableSections('profile', p, globals);
+  // Only offered once Tailscale is enabled in the settings; otherwise the profile is left as it is
+  const useTs = overridableRow(TS_USE, 'profile', p, globals);
+  sections.push(h('section', {}, h('h3', {}, 'Tailscale'), tailscaleEnabled() ? useTs.el
+    : row('', h('small', { style: 'color:var(--muted)' }, 'Not configured: enable and connect Tailscale in ⚙ Settings.'))));
+  if (tailscaleEnabled()) rows.push(useTs);
 
   const save = async () => {
     const newName = name.value.trim();
@@ -346,6 +484,12 @@ function showDialog(title, ...parts) {
 }
 
 /* ---------- home grid ---------- */
+function viaTailscale(profile) {
+  const ts = globalsOf(raw).tailscale || {};
+  const own = (profile.tailscale || {}).use;
+  return !!(own !== undefined ? own : ts.enabled && ts.useByDefault);
+}
+
 function summary(profile) {
   const g = globalsOf(raw);
   const stream = { ...state.defaults.stream, ...(g.stream || {}), ...(profile.stream || {}) };
@@ -375,7 +519,8 @@ function render() {
       h('div', { class: 'monitor' }, h('div', { class: 'screen' }), h('div', { class: 'foot' }), h('div', { class: 'base' })),
       h('div', { class: 'name' }, name),
       h('div', { class: 'sub' }, p.host || ''),
-      h('div', { class: 'badge' }, summary(p)));
+      h('div', { class: 'badge' }, summary(p),
+        viaTailscale(p) ? h('span', { class: 'pill', title: 'Goes through Tailscale (SOCKS5, WebSocket mode)' }, 'Tailscale') : null));
     tile.addEventListener('keydown', e => { if (e.key === 'Enter') connect(name, tile); });
     return tile;
   }), h('div', { class: 'tile add', tabindex: '0', onclick: () => openProfileEditor(null) },
@@ -431,6 +576,8 @@ async function init() {
   $('settings-btn').addEventListener('click', openGlobalEditor);
   $('modal').addEventListener('mousedown', e => { if (e.target === $('modal')) closeModal(); });
   document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+  tsStatus = await api.tailscale.status();
+  api.tailscale.onStatus(s => { tsStatus = s; if (tsRender) tsRender(s); });
   api.onSessionError(msg => toast('Connection failed: ' + msg, false, 12000));
   handleSuggestion(state.suggestion);
   render();

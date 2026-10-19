@@ -24,13 +24,25 @@
       ],
       "category": "Network",
       "icon": "build/icon.png",
-      "syncDesktopName": true
+      "syncDesktopName": true,
+      "extraResources": [
+        {
+          "from": "sidecar/bin/linux-amd64",
+          "to": "sidecar"
+        }
+      ]
     },
     "win": {
       "target": [
         "portable"
       ],
       "icon": "build/icon.png",
+      "extraResources": [
+        {
+          "from": "sidecar/bin/windows-amd64",
+          "to": "sidecar"
+        }
+      ],
       "signtoolOptions": {
         "publisherName": "Selkies Client"
       }

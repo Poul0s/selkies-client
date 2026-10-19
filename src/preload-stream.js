@@ -21,7 +21,7 @@
 // Shortcuts seen from inside the page: still delivered when Chromium holds the
 // keyboard (keyboard lock), and registered before the Selkies handlers so the
 // keys never reach the remote machine.
-const { ipcRenderer } = require('electron');
+const { ipcRenderer, webFrame } = require('electron');
 ipcRenderer.invoke('shortcuts:get').then(defs => {
   if (!defs) return;
   const isChar = k => typeof k === 'string' && /^[a-z0-9]$/i.test(k);
@@ -40,3 +40,19 @@ ipcRenderer.invoke('shortcuts:get').then(defs => {
     }
   }, true);
 }).catch(() => {});
+
+// Tells the main process when the page opens a WebRTC connection (i.e. the server is not in
+// WebSocket mode). The wrapper has to live in the page's own world, hence the injection.
+webFrame.executeJavaScript(`(() => {
+  const PC = window.RTCPeerConnection;
+  if (!PC) return;
+  window.RTCPeerConnection = new Proxy(PC, {
+    construct(target, args, newTarget) {
+      window.postMessage({ type: 'selkies-client:webrtc' }, window.location.origin);
+      return Reflect.construct(target, args, newTarget);
+    },
+  });
+})()`).catch(() => {});
+window.addEventListener('message', e => {
+  if (e.source === window && e.data && e.data.type === 'selkies-client:webrtc') ipcRenderer.send('webrtc-detected');
+});

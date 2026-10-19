@@ -4,3 +4,4 @@ certs/
 config.json
 *.pass
 tools/
+sidecar/bin/

@@ -35,6 +35,7 @@ button.danger { background: var(--danger); }
 .tile .name { font-weight: 600; margin-top: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tile .sub { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tile .badge { margin-top: 8px; font-size: 11px; color: var(--muted); }
+.tile .pill { margin-left: 6px; padding: 1px 7px; border-radius: 9px; background: #1c2a45; color: var(--accent); }
 .tile .edit {
   position: absolute; top: 8px; right: 8px; padding: 2px 8px; background: transparent; color: var(--muted);
   opacity: 0;
@@ -85,3 +86,5 @@ textarea { min-height: 64px; font-family: ui-monospace, Menlo, Consolas, monospa
 input:disabled, select:disabled, textarea:disabled { opacity: .45; }
 input:focus, select:focus, textarea:focus { outline: 1px solid var(--accent); }
 .inherit { display: flex; gap: 5px; align-items: center; color: var(--muted); font-size: 12px; flex: 0 0 auto; }
+button:disabled { opacity: .45; cursor: default; }
+button[hidden] { display: none; }

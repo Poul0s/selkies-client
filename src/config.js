@@ -18,8 +18,14 @@ const DEFAULTS = {
   insecure: false,
   autoHooks: true, // offer to fill the capture hooks for the detected window manager
   // bitrateKbps: 0 = no limit; quality: auto | low | balanced | high | ultra
-  stream: { bitrateKbps: 0, bitrateUnit: 'Mbps', quality: 'auto' },
+  // mode: transport the server runs Selkies in (auto | websocket | webrtc)
+  stream: { bitrateKbps: 0, bitrateUnit: 'Mbps', quality: 'auto', mode: 'auto' },
+  // Embedded Tailscale (SOCKS5 sidecar). Global: enabled, hostname, authKey*, useByDefault.
+  // A profile sets `tailscale.use` to override useByDefault. No auth key = interactive login.
+  tailscale: { enabled: false, hostname: '', authKeyEnv: 'TS_AUTHKEY', useByDefault: false },
 };
+
+const STREAM_MODES = ['auto', 'websocket', 'webrtc'];
 
 // Quality presets mapped to the Selkies client settings they drive:
 // video_crf (lower = better, constant-quality mode) and jpeg_quality.
@@ -78,19 +84,39 @@ function writeRaw(file, raw) {
   fs.writeFileSync(file, JSON.stringify(raw, null, 2) + '\n', { mode: 0o600 });
 }
 
+function readSecretFile(file) {
+  const f = expand(file);
+  if (process.platform !== 'win32' && (fs.statSync(f).mode & 0o077)) {
+    console.warn(`${f} is readable by other users (chmod 600 recommended)`);
+  }
+  return fs.readFileSync(f, 'utf8').replace(/\r?\n$/, '');
+}
+
 function readPassword(cfg, args) {
   // --password is discouraged: visible in `ps`
   if (args.password && args.password !== true) return args.password;
   const fromEnv = process.env[cfg.passwordEnv || 'SELKIES_PASSWORD'];
   if (fromEnv) return fromEnv;
-  if (cfg.passwordFile) {
-    const f = expand(cfg.passwordFile);
-    if (process.platform !== 'win32' && (fs.statSync(f).mode & 0o077)) {
-      console.warn(`${f} is readable by other users (chmod 600 recommended)`);
-    }
-    return fs.readFileSync(f, 'utf8').replace(/\r?\n$/, '');
-  }
+  if (cfg.passwordFile) return readSecretFile(cfg.passwordFile);
   return cfg.password || null;
+}
+
+// Global Tailscale options; hostname falls back to a name derived from this machine
+function tailscaleOptions(raw) {
+  const ts = merge(DEFAULTS.tailscale, raw && raw.tailscale);
+  if (!ts.hostname) {
+    ts.hostname = ('selkies-client-' + os.hostname()).toLowerCase()
+      .replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 63);
+  }
+  return ts;
+}
+
+// Auth key lookup, like the password: environment variable → file → config. null = interactive login
+function readAuthKey(ts) {
+  const fromEnv = process.env[ts.authKeyEnv || 'TS_AUTHKEY'];
+  if (fromEnv) return fromEnv;
+  if (ts.authKeyFile) return readSecretFile(ts.authKeyFile).trim();
+  return ts.authKey || null;
 }
 
 // Settings written into the web client's localStorage before it starts
@@ -222,6 +248,20 @@ function buildConfig(raw, name, args = {}) {
   cfg.profileName = name;
   cfg.saved = !!profiles[name] && !args.host; // can be updated in the config file
   cfg.streamSettings = streamSettings(cfg.stream);
+
+  // Tailscale: the profile's own `use` wins, else the global default (only when enabled).
+  // A profile that asks for it while it is disabled is an error, never a silent direct connection.
+  const ts = cfg.tailscale;
+  cfg.useTailscale = ts.use !== undefined ? !!ts.use : !!(ts.enabled && ts.useByDefault);
+  if (cfg.useTailscale && !ts.enabled) {
+    throw new Error('This profile goes through Tailscale, but Tailscale is not enabled in ⚙ Settings.');
+  }
+  // Expected server transport: a Tailscale profile defaults to websocket (the SOCKS5 proxy only carries TCP)
+  const mode = STREAM_MODES.includes(cfg.stream.mode) ? cfg.stream.mode : 'auto';
+  if (cfg.useTailscale && mode === 'webrtc') {
+    throw new Error('WebRTC needs UDP, which cannot go through the Tailscale SOCKS5 proxy. Set the stream mode to WebSocket.');
+  }
+  cfg.streamMode = mode === 'auto' && cfg.useTailscale ? 'websocket' : mode;
   return cfg;
 }
 
@@ -233,5 +273,6 @@ function loadBoot(userDataDir, argv) {
 }
 
 module.exports = {
-  DEFAULTS, QUALITY_PRESETS, detectHooks, loadBoot, readRaw, writeRaw, buildConfig, streamSettings,
+  DEFAULTS, QUALITY_PRESETS, STREAM_MODES, detectHooks, loadBoot, readRaw, writeRaw, buildConfig,
+  streamSettings, tailscaleOptions, readAuthKey,
 };

@@ -9,6 +9,7 @@ session instead of the local desktop.
 - Multiple server profiles, credentials kept out of the config file if you want
 - Hooks run when the keyboard is captured/released (e.g. switch your window manager to a passthrough mode)
 - Hardened window: sandboxed renderer, navigation limited to the server origin, permission allow-list, certificate pinning
+- Optional embedded **Tailscale** (no install, no admin rights) for the profiles that ask for it, see [Tailscale](#tailscale-optional)
 
 ## Quick start
 
@@ -76,11 +77,16 @@ defaults; each entry in `profiles` overrides them.
 | `stream.bitrateKbps` | Bitrate limit in kbps, `0` = no limit | `0` |
 | `stream.bitrateUnit` | Unit shown in the launcher (`Mbps` / `kbps`) | `Mbps` |
 | `stream.quality` | `auto`, `low`, `balanced`, `high`, `ultra` | `auto` |
+| `stream.mode` | Transport the server runs Selkies in: `auto`, `websocket`, `webrtc` (see [Tailscale](#tailscale-optional)) | `auto` |
 | `autoCapture` | Capture the keyboard once the page has loaded | `true` |
 | `recaptureOnFocus` | Re-capture when the window regains focus | `false` |
 | `hooks.onCapture` / `hooks.onRelease` | List of commands (argv arrays, no shell) | `[]` |
 | `permissions` | Web permissions granted to the server origin | fullscreen, keyboardLock, clipboard, pointerLock, media |
 | `insecure` | Accept any TLS certificate for the server (not recommended) | `false` |
+| `tailscale.enabled` | Turn the embedded Tailscale on (global only) | `false` |
+| `tailscale.hostname` | Node name in the tailnet (global only) | `selkies-client-<hostname>` |
+| `tailscale.authKeyEnv` / `authKeyFile` / `authKey` | Auth key source, in this order of priority (global only; none = interactive login) | `TS_AUTHKEY` |
+| `tailscale.useByDefault` | Profiles go through Tailscale unless they say otherwise | `false` |
 
 Profile keys:
 
@@ -92,6 +98,7 @@ Profile keys:
 | `passwordEnv` | Name of the environment variable holding the password (default `SELKIES_PASSWORD`) |
 | `password` | Plain-text password (discouraged) |
 | `certFingerprint` | Pinned certificate fingerprint for self-signed servers |
+| `tailscale.use` | `true`: this profile goes through Tailscale, `false`: it never does. Absent: `tailscale.useByDefault` |
 | `hooks`, `shortcuts`, … | Any global key can be overridden per profile |
 
 Password lookup order: `--password` → environment variable → `passwordFile` → `password`.
@@ -132,17 +139,96 @@ the profile. (When started with `--host`, copy it into the profile by hand.)
 `onRelease` is also run when the app quits while captured. Hooks are
 platform specific: the `i3-msg` example is Linux-only, use `[]` on Windows.
 
+## Tailscale (optional)
+
+The app embeds a Tailscale node ([`tsnet`](https://pkg.go.dev/tailscale.com/tsnet), in the Go sidecar of `sidecar/`)
+that exposes a SOCKS5 proxy on `127.0.0.1`. Nothing is installed, no root / admin rights are needed, and
+without any Tailscale configuration the app behaves exactly as before: no extra process, no proxy.
+
+**Setup**
+
+1. `make sidecar` (needs Go; builds `sidecar/bin/{linux,windows}-amd64/`, also done by `make build`). If the
+   binary is missing the Tailscale section says so and nothing else is affected.
+2. **⚙ Settings → Tailscale**: tick *Enable Tailscale*, pick the device name and the authentication, click **Connect**.
+   The state (disconnected / starting / waiting for login / connected + tailnet IP) is shown live.
+   You only do this once: the login is kept in `<userData>/tsnet`, *Disconnect* keeps it,
+   *Forget this device* logs the node out of the tailnet and deletes it.
+3. In a profile, **Tailscale → Go through Tailscale (SOCKS5)**. It follows the usual *Override* rule:
+   unchecked = the global *Default* (`tailscale.useByDefault`), checked = the profile's own value, so a profile can
+   also opt out when the default is on. The checkbox only exists once Tailscale is enabled in the Settings.
+   Tiles of such profiles carry a *Tailscale* badge.
+
+**Authentication** (global, like the password: the secret does not have to live in the config file)
+
+- *Interactive login*: the login link is opened in your browser the first time (also reachable with *Open login page*).
+- *Auth key*, from an environment variable (`TS_AUTHKEY` by default), from a file (`authKeyFile`, one line, `chmod 600`),
+  or saved in the config file (`authKey`, discouraged). `TS_AUTHKEY`, when set, wins. The key is handed to the sidecar
+  through its environment, never on the command line. Use a reusable or ephemeral key; it is only needed to register the node.
+
+**How a profile goes through Tailscale**
+
+- The sidecar starts **on demand**: when you click *Connect* in the Settings, or open a profile that uses Tailscale.
+  It stops with the app (or *Disconnect*). A crash is reported with the sidecar's last messages.
+- Only the stream window of such a profile is proxied: it has its own session partition (`persist:tailscale`) with
+  `socks5://127.0.0.1:<port>`. Direct profiles and the launcher stay on Electron's default session, untouched.
+- If Tailscale is not connected when the profile is opened (not logged in, waiting for approval, sidecar missing or
+  crashed), you get a message and the window does **not** open. The app never falls back to a direct connection,
+  and a session whose tunnel is lost ends with a message.
+- Leaks are shut: WebRTC may not use non-proxied UDP (`disable_non_proxied_udp`), and, when Tailscale is enabled at
+  startup, QUIC is disabled and the default session no longer downloads spell-checker dictionaries (Electron fetches
+  them from Google as soon as a session exists, which is a direct connection; the Tailscale session never does).
+- The proxy is closed by default. It refuses everything except: `CONNECT` to the profile's own `host:port`, which must also
+  be a Tailscale address (100.64.0.0/10, fd7a:115c:a1e0::/48) or a tailnet peer name resolved by the tailnet itself
+  (never by the system DNS). Nothing is reachable while no Tailscale session is open.
+
+**Stream mode**
+
+The SOCKS5 proxy only carries TCP, so a profile that goes through it needs Selkies in **WebSocket mode**.
+`stream.mode` (*Server mode* in the editor, overridable per profile) says which transport the server runs:
+`auto` means WebSocket for a Tailscale profile and "don't care" otherwise; an explicit `webrtc` with Tailscale is refused.
+The client cannot change the server's mode (the web UI follows the server) and cannot drive the
+[RemoteControl bot](../RemoteControl), which is a Discord bot. So the mode is asked on the server side:
+
+```
+/start selkies mode:websocket        (Discord bot; add funnel:True to expose it on the Internet as well)
+```
+
+If the page nevertheless opens a WebRTC connection, the client shows a warning with that command (best effort:
+it watches `RTCPeerConnection`). Without Tailscale the server's default (WebRTC) keeps working as before.
+
+**Limits**
+
+- WebSocket mode only, no UDP relay: expect the cost of video over TCP (head-of-line blocking on lossy links) and of
+  userspace WireGuard. Check 1080p60 on your link; lower the bitrate limit if needed.
+- The server must be a node of the tailnet (MagicDNS name or 100.x address). Subnet routers and exit nodes are not used.
+- Chromium has no SOCKS5 authentication, so any local process can connect to the proxy port, but it can only reach the
+  profile that is currently open.
+- One tailnet identity per app. The device name and auth settings are global; changing them restarts the sidecar on
+  the next connection. The QUIC switch needs a restart of the app after enabling Tailscale.
+- There is no main-process network traffic related to a profile today; if some is added it must use
+  `session.fromPartition('persist:tailscale')` (e.g. `ses.fetch`), not the global `net`.
+- Linux and Windows (amd64) only; the sidecar adds ~22 MB to the package.
+
+**Checking for leaks without root**: run the app and a `tcpdump` inside a user + network namespace
+(`unshare -Urn`) that only has `lo` and a dummy interface carrying the default route. Everything that does not
+go through the loopback proxy then shows up on the dummy interface. With the sidecar's tailnet side replaced by a stub,
+startup, an idle launcher and a Tailscale session whose page tries WebRTC/STUN, `fetch` and WebSocket to outside addresses
+produce no packet on it, except two IGMP reports when the page opens a WebRTC connection (a WebSocket-mode page
+produces none). A direct profile in the same run is clearly visible there (TCP SYNs, STUN over UDP).
+
 ## Building
 
 Everything goes through the `Makefile` (run `make help`):
 
 | Command | Result |
 | --- | --- |
-| `make build` | Linux AppImage + Windows portable exe |
+| `make sidecar` | Tailscale sidecar for linux/amd64 and windows/amd64 in `sidecar/bin/` (Go; the first build downloads the Go toolchain and modules) |
+| `make sidecar-test` | Go tests of the sidecar (SOCKS5 server and destination policy) |
+| `make build` | Sidecar + Linux AppImage + Windows portable exe |
 | `make build-linux` | `dist/Selkies Client-<version>-linux.AppImage` |
 | `make build-win` | `dist/Selkies Client-<version>-win.exe` (signed) |
 | `make cert` | Regenerate the self-signed code-signing certificate in `certs/` |
-| `make clean` / `make distclean` | Remove `dist/` / also `node_modules/`, `certs/`, `tools/` |
+| `make clean` / `make distclean` | Remove `dist/` / also `node_modules/`, `certs/`, `tools/`, `sidecar/bin/` |
 
 Notes:
 
@@ -157,14 +243,17 @@ Notes:
   SmartScreen will still warn. To fix that, buy a certificate from a trusted CA and run
   `WIN_CSC_LINK=cert.pfx WIN_CSC_KEY_PASSWORD=… npm run dist:win`.
 - Never commit `certs/`.
+- The sidecar goes into the package through `extraResources` (`resources/sidecar/`); in dev it is read from `sidecar/bin/`.
 - Icon: `build/icon.png` (512×512).
 
 ## Project layout
 
 ```
-src/main.js            launcher + stream windows, keyboard capture, hooks, TLS/auth/permissions
-src/config.js          config read/write, profiles, CLI arguments, stream settings
-src/preload-stream.js  seeds bitrate/quality into the Selkies page's localStorage
+src/main.js            launcher + stream windows, keyboard capture, hooks, TLS/auth/permissions, per-profile proxy session
+src/config.js          config read/write, profiles, CLI arguments, stream settings, Tailscale options
+src/tailscale.js       runs the Tailscale sidecar on demand and tracks its state
+src/preload-stream.js  seeds bitrate/quality into the Selkies page's localStorage, reports WebRTC use
+sidecar/               Go + tsnet: SOCKS5 proxy on 127.0.0.1 (main.go, socks.go, policy.go)
 src/ui/                launcher (index.html, app.js, style.css, preload.js)
 build/icon.png   application icon
 Makefile         install / start / build / sign

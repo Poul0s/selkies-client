@@ -4,14 +4,27 @@ const { execFile, execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const config = require('./config');
+const tailscale = require('./tailscale');
 
 // Stable userData path, regardless of how the app is launched
 app.setPath('userData', path.join(app.getPath('appData'), 'selkies-client'));
 
 const ICON = path.join(__dirname, 'icon.png');
+const TS_PARTITION = 'persist:tailscale'; // the only session that ever gets the SOCKS5 proxy
+const TS_STATE = path.join(app.getPath('userData'), 'tsnet');
 
-let boot;                 // { args, file, direct }
+const boot = config.loadBoot(app.getPath('userData'), process.argv); // { args, file, direct }
+// With Tailscale enabled, close the leaks that would bypass the tunnel (needs a restart to change)
+let tsEnabled = false;
+try { tsEnabled = !!config.readRaw(boot.file).tailscale?.enabled; } catch { /* reported by the launcher */ }
+// A SOCKS5 proxy cannot carry QUIC (UDP) anyway: switch it off outright
+if (tsEnabled) app.commandLine.appendSwitch('disable-quic');
+
 let cfg, win, launcher;   // cfg/win: the running stream session, if any
+let connecting = false;
+let tsListener = null;    // watches the sidecar while a Tailscale session is open
+let tsGrace = null;
+let webrtcWarned = false;
 let captured = false;
 let loginAttempts = 0;
 let certDialogShown = false;
@@ -27,6 +40,9 @@ const NET_ERRORS = {
   ERR_ADDRESS_UNREACHABLE: 'Address unreachable: check the network or VPN.',
   ERR_INTERNET_DISCONNECTED: 'No network connection.',
   ERR_CONNECTION_RESET: 'Connection reset by the server.',
+  ERR_PROXY_CONNECTION_FAILED: 'Cannot reach the Tailscale proxy (the sidecar stopped?).',
+  ERR_SOCKS_CONNECTION_FAILED: 'The Tailscale proxy could not open the connection.',
+  ERR_SOCKS_CONNECTION_HOST_UNREACHABLE: 'Host unreachable through Tailscale: is the server a node of your tailnet, and online?',
   ERR_SSL_PROTOCOL_ERROR: 'TLS error: the server may be using plain HTTP (try http://host:port).',
   ERR_CERT_AUTHORITY_INVALID: 'The server certificate is not trusted.',
 };
@@ -147,10 +163,14 @@ function createStreamWindow() {
       spellcheck: false,
       preload: path.join(__dirname, 'preload-stream.js'),
       additionalArguments,
+      // Own session, so the proxy set for it can never apply to a direct profile
+      ...(cfg.useTailscale ? { partition: TS_PARTITION } : {}),
     },
   });
 
   const wc = win.webContents;
+  // UDP cannot follow the proxy: forbid WebRTC from using it (it would leave the tunnel)
+  if (cfg.useTailscale) wc.setWebRTCIPHandlingPolicy('disable_non_proxied_udp');
   wc.setWindowOpenHandler(() => ({ action: 'deny' }));
   wc.on('will-navigate', (e, url) => {
     try { if (new URL(url).origin !== cfg.origin) e.preventDefault(); }
@@ -175,7 +195,9 @@ function createStreamWindow() {
 
   wc.on('did-fail-load', (e, code, desc, url, isMainFrame) => {
     if (!isMainFrame || code === -3) return; // -3: aborted (navigation replaced)
-    failSession(NET_ERRORS[desc] || `${desc} (${code})`);
+    let msg = NET_ERRORS[desc] || `${desc} (${code})`;
+    const denied = cfg.useTailscale && /SOCKS|PROXY/.test(desc) && tailscale.getStatus().denied;
+    failSession(denied ? `${msg}\nProxy: ${denied}` : msg);
   });
 
   // Avoid leaving the WM in passthrough mode when the window loses focus
@@ -189,6 +211,7 @@ function createStreamWindow() {
   });
   win.on('closed', () => {
     clearTimeout(loadTimer);
+    unwatchTailscale();
     win = null;
     cfg = null;
     if (launcher) {
@@ -214,30 +237,95 @@ function createStreamWindow() {
   setTimeout(load, 1500);
 }
 
-// Starts a session; returns { ok } or { error } for the launcher
-function connect(name, args = {}) {
-  if (win) return { error: 'A session is already running' };
-  let c;
+/* ---------- tailscale ---------- */
+function startTailscale() {
+  const ts = config.tailscaleOptions(config.readRaw(boot.file));
+  return tailscale.start({ stateDir: TS_STATE, hostname: ts.hostname, authKey: config.readAuthKey(ts) });
+}
+
+// Brings the sidecar up and points the Tailscale session at it. Returns an error message,
+// never a silent fallback to a direct connection.
+async function prepareTailscale(c) {
   try {
-    c = config.buildConfig(config.readRaw(boot.file), name, args);
-    if (!c.password) {
-      return { error: 'No password: set one in the profile, or define SELKIES_PASSWORD.' };
-    }
+    await startTailscale();
+    await tailscale.waitConnected();
   } catch (e) {
-    return { error: e.message };
+    return `Tailscale: ${e.message}`;
   }
-  cfg = c;
-  shortcuts = {
-    toggle: parseShortcut(cfg.shortcuts.toggleCapture),
-    reload: parseShortcut(cfg.shortcuts.reload),
-    disconnect: parseShortcut(cfg.shortcuts.disconnect),
+  // The proxy may only reach this profile's server
+  tailscale.setAllow([c.hostname.includes(':') ? `[${c.hostname}]:${c.port}` : `${c.hostname}:${c.port}`]);
+  const ses = session.fromPartition(TS_PARTITION);
+  await ses.setProxy({ proxyRules: tailscale.proxyRules() });
+  await ses.closeAllConnections(); // nothing left over from an earlier port
+  return null;
+}
+
+// While a Tailscale session is open, losing the tunnel ends it with a clear message
+function watchTailscale() {
+  const lost = {
+    off: 'Tailscale was disconnected.',
+    login: 'Tailscale needs a new login.',
+    approval: 'This device is no longer approved on the tailnet.',
   };
-  loginAttempts = 0;
-  certDialogShown = false;
-  certDecision = null;
-  createStreamWindow();
-  if (launcher) launcher.hide();
-  return { ok: true };
+  tsListener = s => {
+    clearTimeout(tsGrace);
+    if (s.state === 'connected') return;
+    if (s.running && ['starting', 'connecting', 'error'].includes(s.state)) { // may recover on its own
+      tsGrace = setTimeout(() => failSession(s.error || 'Tailscale lost its connection.'), 15000);
+    } else {
+      failSession(s.state === 'error' ? s.error : lost[s.state] || 'Tailscale lost its connection.');
+    }
+  };
+  tailscale.events.on('status', tsListener);
+}
+
+function unwatchTailscale() {
+  clearTimeout(tsGrace);
+  if (!tsListener) return;
+  tailscale.events.off('status', tsListener);
+  tsListener = null;
+  tailscale.setAllow([]); // the proxy reaches nothing once the session is over
+}
+
+tailscale.events.on('status', s => {
+  if (launcher) launcher.webContents.send('tailscale:status', s);
+});
+
+// Starts a session; returns { ok } or { error } for the launcher
+async function connect(name, args = {}) {
+  if (win || connecting) return { error: 'A session is already running' };
+  connecting = true;
+  try {
+    let c;
+    try {
+      c = config.buildConfig(config.readRaw(boot.file), name, args);
+      if (!c.password) {
+        return { error: 'No password: set one in the profile, or define SELKIES_PASSWORD.' };
+      }
+    } catch (e) {
+      return { error: e.message };
+    }
+    if (c.useTailscale) {
+      const error = await prepareTailscale(c);
+      if (error) return { error };
+    }
+    cfg = c;
+    shortcuts = {
+      toggle: parseShortcut(cfg.shortcuts.toggleCapture),
+      reload: parseShortcut(cfg.shortcuts.reload),
+      disconnect: parseShortcut(cfg.shortcuts.disconnect),
+    };
+    loginAttempts = 0;
+    certDialogShown = false;
+    certDecision = null;
+    webrtcWarned = false;
+    createStreamWindow();
+    if (cfg.useTailscale) watchTailscale();
+    if (launcher) launcher.hide();
+    return { ok: true };
+  } finally {
+    connecting = false;
+  }
 }
 
 /* ---------- launcher window ---------- */
@@ -291,6 +379,54 @@ ipcMain.handle('config:save', (e, raw) => {
 ipcMain.handle('session:connect', (e, name) => {
   if (!trustedSender(e)) return { error: 'forbidden' };
   return connect(name);
+});
+
+ipcMain.handle('tailscale:status', e => (trustedSender(e) ? tailscale.getStatus() : null));
+
+ipcMain.handle('tailscale:connect', async e => {
+  if (!trustedSender(e)) return { error: 'forbidden' };
+  try {
+    if (!config.tailscaleOptions(config.readRaw(boot.file)).enabled) throw new Error('Tailscale is not enabled.');
+    await startTailscale();
+    return { ok: true };
+  } catch (err) { return { error: err.message }; }
+});
+
+ipcMain.handle('tailscale:disconnect', async e => {
+  if (!trustedSender(e)) return { error: 'forbidden' };
+  await tailscale.stop(); // the saved state stays: connecting again needs no new login
+  return { ok: true };
+});
+
+// Deregisters this device from the tailnet and deletes its saved state
+ipcMain.handle('tailscale:forget', async e => {
+  if (!trustedSender(e)) return { error: 'forbidden' };
+  try {
+    if (!tailscale.getStatus().available) throw new Error(tailscale.getStatus().reason);
+    if (fs.existsSync(TS_STATE)) { // log out from a connected node, so it leaves the admin console
+      await startTailscale();
+      await tailscale.waitConnected(10000).catch(() => {});
+    }
+    await tailscale.forget(TS_STATE);
+    return { ok: true };
+  } catch (err) { return { error: err.message }; }
+});
+
+ipcMain.handle('tailscale:login', e => { if (trustedSender(e)) tailscale.openLogin(); });
+
+// The stream preload reports when the page starts a WebRTC connection
+ipcMain.on('webrtc-detected', e => {
+  if (!win || e.sender !== win.webContents || webrtcWarned || cfg.streamMode === 'webrtc') return;
+  webrtcWarned = true;
+  dialog.showMessageBox(win, {
+    type: 'warning',
+    title: 'WebRTC detected',
+    message: cfg.useTailscale
+      ? 'This server streams with WebRTC (UDP), which cannot go through the Tailscale proxy: the video will not start.'
+      : 'This profile expects WebSocket mode, but the server streams with WebRTC.',
+    detail: 'Restart Selkies in WebSocket mode on the server (with the Discord bot: /start selkies mode:websocket), '
+      + 'then reload the page.',
+  });
 });
 
 /* ---------- network: certificate, auth, permissions ---------- */
@@ -361,12 +497,11 @@ app.on('login', (event, wc, details, authInfo, callback) => {
   callback(cfg.user, cfg.password);
 });
 
-function setupPermissions() {
+function setupPermissions(ses) {
   const allowed = (permission, origin) => {
     try { return !!cfg && new URL(origin).origin === cfg.origin && cfg.permissions.includes(permission); }
     catch { return false; }
   };
-  const ses = session.defaultSession;
   // HTTP errors on the page itself (502 behind a proxy, 404 on a wrong path...)
   ses.webRequest.onCompleted({ urls: ['*://*/*'] }, details => {
     if (details.resourceType !== 'mainFrame' || !win || details.webContentsId !== win.webContents.id) return;
@@ -381,10 +516,16 @@ function setupPermissions() {
 }
 
 /* ---------- lifecycle ---------- */
-app.whenReady().then(() => {
-  boot = config.loadBoot(app.getPath('userData'), process.argv);
+app.whenReady().then(async () => {
   if (process.platform !== 'darwin') Menu.setApplicationMenu(null);
-  setupPermissions();
+  setupPermissions(session.defaultSession);
+  const tsSession = session.fromPartition(TS_PARTITION);
+  setupPermissions(tsSession);
+  // Electron downloads spell-checker dictionaries (from Google) as soon as a session exists: a direct
+  // connection, before the proxy is even set. Not needed here, so never do it for the Tailscale session
+  // nor, with Tailscale enabled, for the default one.
+  tsSession.setSpellCheckerLanguages([]);
+  if (tsEnabled) session.defaultSession.setSpellCheckerLanguages([]);
 
   if (boot.direct) { // --profile / --host: skip the launcher
     let res;
@@ -394,7 +535,7 @@ app.whenReady().then(() => {
         throw new Error(`Unknown profile: ${boot.args.profile}`);
       }
       // connect() re-reads the file; pass CLI overrides through
-      res = connect(boot.args.profile, boot.args);
+      res = await connect(boot.args.profile, boot.args);
     } catch (e) {
       res = { error: e.message };
     }
@@ -409,6 +550,7 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => app.quit());
 app.on('will-quit', () => {
+  tailscale.shutdown();
   if (captured && cfg) {     // never leave the WM in passthrough
     captured = false;
     runHooks(cfg.hooks.onRelease, true);

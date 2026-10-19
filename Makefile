@@ -4,17 +4,22 @@ CERT_PASS ?= selkies
 OSSL_DIR  := tools
 OSSL_BIN  := $(OSSL_DIR)/pkg/usr/bin/osslsigncode
 
-.PHONY: help install start build build-linux build-win cert clean distclean
+SIDECAR_LINUX := sidecar/bin/linux-amd64/tailscale-sidecar
+SIDECAR_WIN   := sidecar/bin/windows-amd64/tailscale-sidecar.exe
+SIDECAR_SRC   := $(wildcard sidecar/*.go) sidecar/go.mod sidecar/go.sum
+
+.PHONY: help install start build build-linux build-win sidecar sidecar-test cert clean distclean
 
 help:
 	@echo "make install      installe les dépendances npm"
 	@echo "make start        lance l'app en mode dev"
-	@echo "make build        AppImage Linux + .exe Windows portable (signé)"
+	@echo "make sidecar      compile le sidecar Tailscale (Go) pour linux et windows (amd64)"
+	@echo "make build        sidecar + AppImage Linux + .exe Windows portable (signé)"
 	@echo "make build-linux  AppImage seulement"
 	@echo "make build-win    .exe portable seulement (signé avec $(CERT_PFX))"
 	@echo "make cert         (re)génère le certificat auto-signé"
 	@echo "make clean        supprime dist/"
-	@echo "make distclean    supprime dist/, node_modules/ et certs/"
+	@echo "make distclean    supprime dist/, node_modules/, certs/ et le sidecar compilé"
 
 install:
 	npm install
@@ -28,11 +33,23 @@ start: node_modules
 
 build: build-linux build-win
 
-build-linux: node_modules
+build-linux: node_modules $(SIDECAR_LINUX)
 	npm run dist:linux
 
-build-win: node_modules $(CERT_PFX) $(OSSL_BIN)
+build-win: node_modules $(CERT_PFX) $(OSSL_BIN) $(SIDECAR_WIN)
 	ELECTRON_BUILDER_OSSL_SIGNCODE_PATH=$(abspath $(OSSL_BIN)) WIN_CSC_LINK=$(abspath $(CERT_PFX)) WIN_CSC_KEY_PASSWORD=$(CERT_PASS) npm run dist:win
+
+# Tailscale sidecar (sidecar/): static binaries, no cgo. `make start` runs the dev copy of the host platform.
+sidecar: $(SIDECAR_LINUX) $(SIDECAR_WIN)
+
+$(SIDECAR_LINUX): $(SIDECAR_SRC)
+	cd sidecar && GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o ../$@ .
+
+$(SIDECAR_WIN): $(SIDECAR_SRC)
+	cd sidecar && GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o ../$@ .
+
+sidecar-test:
+	cd sidecar && go test ./...
 
 OSSL_VER  := 2.14
 OSSL_SRC  := $(OSSL_DIR)/src/osslsigncode-$(OSSL_VER)
@@ -71,4 +88,4 @@ clean:
 	rm -rf dist
 
 distclean: clean
-	rm -rf node_modules $(CERT_DIR) $(OSSL_DIR)
+	rm -rf node_modules $(CERT_DIR) $(OSSL_DIR) sidecar/bin
