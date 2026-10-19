@@ -34,10 +34,24 @@ build-linux: node_modules
 build-win: node_modules $(CERT_PFX) $(OSSL_BIN)
 	ELECTRON_BUILDER_OSSL_SIGNCODE_PATH=$(abspath $(OSSL_BIN)) WIN_CSC_LINK=$(abspath $(CERT_PFX)) WIN_CSC_KEY_PASSWORD=$(CERT_PASS) npm run dist:win
 
+OSSL_VER  := 2.14
+OSSL_SRC  := $(OSSL_DIR)/src/osslsigncode-$(OSSL_VER)
+
+# osslsigncode: use apt if available (Debian/Ubuntu), else build from source
+# (no root needed either way, e.g. Arch where it is only in the AUR)
 $(OSSL_BIN):
+ifneq ($(shell command -v apt-get),)
 	@mkdir -p $(OSSL_DIR)/dl
 	cd $(OSSL_DIR)/dl && apt-get download osslsigncode
 	dpkg-deb -x $(OSSL_DIR)/dl/osslsigncode_*.deb $(OSSL_DIR)/pkg
+else
+	@mkdir -p $(OSSL_SRC) $(dir $(OSSL_BIN))
+	curl -fsSL https://github.com/mtrojnar/osslsigncode/archive/refs/tags/$(OSSL_VER).tar.gz \
+	  | tar -xz -C $(OSSL_SRC) --strip-components=1
+	cmake -S $(OSSL_SRC) -B $(OSSL_SRC)/build -DCMAKE_BUILD_TYPE=Release
+	cmake --build $(OSSL_SRC)/build -j
+	install -Dm755 $(OSSL_SRC)/build/osslsigncode $(OSSL_BIN)
+endif
 
 $(CERT_PFX):
 	@mkdir -p $(CERT_DIR)

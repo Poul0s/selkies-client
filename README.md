@@ -151,8 +151,9 @@ Notes:
 - **Signing**: `make build-win` creates a self-signed certificate (`certs/`,
   password `selkies`, override with `CERT_PASS=…`) and signs the exe with
   `osslsigncode`. The one bundled with electron-builder needs libcrypto 1.1,
-  so the Makefile extracts the distribution package (`apt-get download`, no root)
-  into `tools/`. A self-signed signature is **not trusted** by Windows:
+  so the Makefile installs its own copy into `tools/` without root: it extracts
+  the distribution package (`apt-get download`) when apt exists, otherwise (e.g. Arch)
+  it builds it from source (needs `cmake`, `gcc`, OpenSSL and libcurl headers). A self-signed signature is **not trusted** by Windows:
   SmartScreen will still warn. To fix that, buy a certificate from a trusted CA and run
   `WIN_CSC_LINK=cert.pfx WIN_CSC_KEY_PASSWORD=… npm run dist:win`.
 - Never commit `certs/`.
